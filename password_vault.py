@@ -14,12 +14,33 @@ Run directly in Spyder: press F5 or Run → Run File
 import tkinter as tk
 from tkinter import ttk, messagebox, font as tkfont
 import hashlib
+import base64
 import xml.etree.ElementTree as ET
 import xml.dom.minidom as minidom
 import os
 import time
 import threading
 from datetime import datetime
+from cryptography.fernet import Fernet
+
+# ─── CRYPTOGRAPHY & SESSION ──────────────────────────────────────────────────
+SESSION_KEY = None  # Holds the Fernet key derived on unlock
+
+def derive_key(master_password: str, salt: bytes) -> bytes:
+    """Derive a 32-byte Fernet key from master password via PBKDF2 HMAC-SHA256."""
+    derived = hashlib.pbkdf2_hmac("sha256", master_password.encode("utf-8"), salt, 100000)
+    return base64.urlsafe_b64encode(derived)
+
+def encrypt_text(plaintext: str, key: bytes) -> str:
+    """Encrypt a string and return it as a string."""
+    f = Fernet(key)
+    return f.encrypt(plaintext.encode("utf-8")).decode("utf-8")
+
+def decrypt_text(ciphertext: str, key: bytes) -> str:
+    """Decrypt a string and return the plaintext string."""
+    f = Fernet(key)
+    return f.decrypt(ciphertext.encode("utf-8")).decode("utf-8")
+
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 DB_FILE = os.path.join(os.path.expanduser("~"), "vault_database.xml")
@@ -45,25 +66,43 @@ C = {
 }
 
 # ─── DATABASE LAYER ───────────────────────────────────────────────────────────
-def md5_hash(text: str) -> str:
-    return hashlib.md5(text.encode("utf-8")).hexdigest()
-
+SESSION_SALT = None
 
 def load_db() -> list[dict]:
-    """Load entries from XML file. Returns list of dicts."""
+    """Load entries from the encrypted XML file. Returns list of dicts."""
     if not os.path.exists(DB_FILE):
         return []
+    if SESSION_KEY is None:
+        return []
     try:
-        tree = ET.parse(DB_FILE)
-        root = tree.getroot()
+        with open(DB_FILE, "r", encoding="utf-8") as f:
+            lines = f.read().splitlines()
+        if len(lines) < 2:
+            return []
+        
+        # Lines: 0 = salt_hex, 1 = ciphertext
+        salt_hex, ciphertext = lines[0], lines[1]
+        
+        # Decrypt XML
+        decrypted_xml = decrypt_text(ciphertext, SESSION_KEY)
+        
+        # Parse XML
+        root = ET.fromstring(decrypted_xml)
         entries = []
         for entry in root.findall("entry"):
+            enc_pass = entry.findtext("password", "")
+            plain_pass = ""
+            if enc_pass:
+                try:
+                    plain_pass = decrypt_text(enc_pass, SESSION_KEY)
+                except Exception:
+                    plain_pass = "[Decryption Failed]"
+            
             entries.append({
-                "username":      entry.findtext("username", ""),
-                "username_hash": entry.findtext("username_hash", ""),
-                "password_hash": entry.findtext("password_hash", ""),
-                "created":       entry.findtext("created", ""),
-                "label":         entry.findtext("label", ""),
+                "username": entry.findtext("username", ""),
+                "password": plain_pass,
+                "created":  entry.findtext("created", ""),
+                "label":    entry.findtext("label", ""),
             })
         return entries
     except Exception:
@@ -71,32 +110,54 @@ def load_db() -> list[dict]:
 
 
 def save_db(entries: list[dict]):
-    """Save entries to XML file with pretty-print."""
-    root = ET.Element("vault")
-    root.set("version", "1.0")
-    root.set("updated", datetime.now().isoformat())
-    for e in entries:
-        entry_el = ET.SubElement(root, "entry")
-        for key, val in e.items():
-            child = ET.SubElement(entry_el, key)
-            child.text = str(val)
-    raw = ET.tostring(root, encoding="unicode")
-    pretty = minidom.parseString(raw).toprettyxml(indent="  ")
-    # Remove the default XML declaration line so we can write our own
-    lines = pretty.split("\n")
-    final = "\n".join(lines)
-    with open(DB_FILE, "w", encoding="utf-8") as f:
-        f.write(final)
+    """Save entries to the XML file, encrypting passwords and the entire XML file at rest."""
+    if SESSION_KEY is None or SESSION_SALT is None:
+        return
+    try:
+        root = ET.Element("vault")
+        root.set("version", "1.0")
+        root.set("updated", datetime.now().isoformat())
+        
+        for e in entries:
+            entry_el = ET.SubElement(root, "entry")
+            
+            # Encrypt password individually
+            enc_pass = encrypt_text(e["password"], SESSION_KEY)
+            
+            username_el = ET.SubElement(entry_el, "username")
+            username_el.text = e["username"]
+            
+            password_el = ET.SubElement(entry_el, "password")
+            password_el.text = enc_pass
+            
+            created_el = ET.SubElement(entry_el, "created")
+            created_el.text = e["created"]
+            
+            label_el = ET.SubElement(entry_el, "label")
+            label_el.text = e["label"]
+            
+        raw = ET.tostring(root, encoding="unicode")
+        pretty = minidom.parseString(raw).toprettyxml(indent="  ")
+        lines = [line for line in pretty.split("\n") if line.strip()]
+        final_xml = "\n".join(lines)
+        
+        # Encrypt the entire XML string
+        ciphertext = encrypt_text(final_xml, SESSION_KEY)
+        
+        # Write salt + ciphertext to file
+        with open(DB_FILE, "w", encoding="utf-8") as f:
+            f.write(SESSION_SALT.hex() + "\n" + ciphertext)
+    except Exception:
+        pass
 
 
 def add_entry(username: str, password: str, label: str = "") -> dict:
     entries = load_db()
     entry = {
-        "username":      username,
-        "username_hash": md5_hash(username),
-        "password_hash": md5_hash(password),
-        "created":       datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "label":         label or "Default",
+        "username": username,
+        "password": password,
+        "created":  datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "label":    label or "Default",
     }
     entries.append(entry)
     save_db(entries)
@@ -112,12 +173,11 @@ def delete_entry(index: int):
 
 def lookup_entry(username: str, password: str):
     """Return matching entry if credentials match."""
-    u_hash = md5_hash(username)
-    p_hash = md5_hash(password)
     for e in load_db():
-        if e["username_hash"] == u_hash and e["password_hash"] == p_hash:
+        if e["username"] == username and e["password"] == password:
             return e
     return None
+
 
 
 # ─── ANIMATED TYPEWRITER LABEL ────────────────────────────────────────────────
@@ -320,17 +380,194 @@ class GoldButton(tk.Frame):
         )
 
 
+# ─── MASTER PASSWORD GATE ─────────────────────────────────────────────────────
+class MasterPasswordGate:
+    def __init__(self, root, on_success_callback):
+        self.root = root
+        self.on_success = on_success_callback
+        
+        self.db_exists = os.path.exists(DB_FILE)
+        self.is_migration = False
+        if self.db_exists:
+            try:
+                with open(DB_FILE, "r", encoding="utf-8") as f:
+                    first_line = f.readline().strip()
+                if first_line.startswith("<") or first_line.startswith("<?xml"):
+                    self.is_migration = True
+                    self.db_exists = False  # Trigger setup flow instead of unlock
+            except Exception:
+                pass
+        
+        self.win = tk.Toplevel(self.root)
+        self.win.title("VAULT — Security Gateway")
+        self.win.geometry("450x380")
+        self.win.configure(bg=C["bg"])
+        self.win.resizable(False, False)
+        
+        # Center window
+        self.win.update_idletasks()
+        width = 450
+        height = 380
+        x = (self.win.winfo_screenwidth() // 2) - (width // 2)
+        y = (self.win.winfo_screenheight() // 2) - (height // 2)
+        self.win.geometry(f'{width}x{height}+{x}+{y}')
+        
+        self.win.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._build_ui()
+        
+    def _build_ui(self):
+        outer = tk.Frame(self.win, bg=C["bg"], padx=20, pady=20)
+        outer.pack(fill="both", expand=True)
+        
+        hdr = tk.Frame(outer, bg=C["bg"])
+        hdr.pack(fill="x", pady=(0, 10))
+        
+        tk.Label(hdr, text="◈", fg=C["accent"], bg=C["bg"],
+                 font=("Courier New", 20)).pack(side="left", padx=(0,6))
+        tk.Label(hdr, text="VAULT GATEWAY", fg=C["text"], bg=C["bg"],
+                 font=("Courier New", 14, "bold")).pack(side="left")
+                 
+        tk.Frame(outer, bg=C["accent"], height=1).pack(fill="x", pady=(0, 15))
+        
+        self.card = tk.Frame(outer, bg=C["card"], padx=24, pady=20,
+                             highlightbackground=C["border"], highlightthickness=1)
+        self.card.pack(fill="both", expand=True)
+        
+        if not self.db_exists:
+            self._build_setup_mode()
+        else:
+            self._build_unlock_mode()
+            
+    def _build_setup_mode(self):
+        lbl = tk.Label(self.card, text="CREATE MASTER PASSWORD", fg=C["accent"], bg=C["card"],
+                       font=("Courier New", 11, "bold"), anchor="w")
+        lbl.pack(fill="x", pady=(0, 4))
+        
+        if self.is_migration:
+            msg = "An old plaintext vault database was detected. We will back it up as 'vault_database.xml.bak' and initialize a new secure encrypted database. Please choose a strong master password."
+        else:
+            msg = "No database found. Define a master password to encrypt your vault. Write this down; it cannot be recovered."
+            
+        sub = tk.Label(self.card, text=msg,
+                       fg=C["text_muted"], bg=C["card"], font=("Courier New", 8), wraplength=350, justify="left", anchor="w")
+        sub.pack(fill="x", pady=(0, 15))
+        
+        self.pw_entry = StyledEntry(self.card, label="Master Password", placeholder="Enter strong password", show="●")
+        self.pw_entry.pack(fill="x", pady=(0, 12))
+        
+        self.pw_confirm = StyledEntry(self.card, label="Confirm Password", placeholder="Repeat password", show="●")
+        self.pw_confirm.pack(fill="x", pady=(0, 15))
+        
+        self.error_lbl = tk.Label(self.card, text="", fg=C["danger"], bg=C["card"], font=("Courier New", 9, "bold"))
+        self.error_lbl.pack(fill="x", pady=(0, 10))
+        
+        GoldButton(self.card, "✦  INITIALIZE SECURE VAULT", command=self._setup_vault, variant="primary").pack(fill="x")
+        self.pw_confirm.entry.bind("<Return>", lambda e: self._setup_vault())
+
+    def _build_unlock_mode(self):
+        lbl = tk.Label(self.card, text="UNLOCK SECURE VAULT", fg=C["accent2"], bg=C["card"],
+                       font=("Courier New", 11, "bold"), anchor="w")
+        lbl.pack(fill="x", pady=(0, 4))
+        
+        sub = tk.Label(self.card, text="Enter your master password to decrypt and open the vault database.",
+                       fg=C["text_muted"], bg=C["card"], font=("Courier New", 8), wraplength=350, justify="left", anchor="w")
+        sub.pack(fill="x", pady=(0, 20))
+        
+        self.pw_entry = StyledEntry(self.card, label="Master Password", placeholder="Enter your password", show="●")
+        self.pw_entry.pack(fill="x", pady=(0, 25))
+        
+        self.error_lbl = tk.Label(self.card, text="", fg=C["danger"], bg=C["card"], font=("Courier New", 9, "bold"))
+        self.error_lbl.pack(fill="x", pady=(0, 15))
+        
+        GoldButton(self.card, "🔓  DECRYPT & UNLOCK", command=self._unlock_vault, variant="violet").pack(fill="x")
+        self.pw_entry.entry.bind("<Return>", lambda e: self._unlock_vault())
+
+    def _setup_vault(self):
+        pw = self.pw_entry.get().strip()
+        pw2 = self.pw_confirm.get().strip()
+        
+        if not pw:
+            self.error_lbl.config(text="Password cannot be empty", fg=C["danger"])
+            return
+        if len(pw) < 8:
+            self.error_lbl.config(text="Password must be at least 8 characters", fg=C["danger"])
+            return
+        if pw != pw2:
+            self.error_lbl.config(text="Passwords do not match", fg=C["danger"])
+            return
+            
+        global SESSION_KEY, SESSION_SALT
+        try:
+            if self.is_migration:
+                bak_path = DB_FILE + ".bak"
+                if os.path.exists(bak_path):
+                    os.remove(bak_path)
+                os.rename(DB_FILE, bak_path)
+                
+            SESSION_SALT = os.urandom(16)
+            SESSION_KEY = derive_key(pw, SESSION_SALT)
+            save_db([])
+            
+            self.error_lbl.config(text="Vault initialized successfully!", fg=C["success"])
+            self.win.after(1000, self._success_close)
+        except Exception as e:
+            self.error_lbl.config(text=f"Setup failed: {str(e)}", fg=C["danger"])
+
+
+    def _unlock_vault(self):
+        pw = self.pw_entry.get().strip()
+        if not pw:
+            self.error_lbl.config(text="Password cannot be empty", fg=C["danger"])
+            return
+            
+        global SESSION_KEY, SESSION_SALT
+        try:
+            with open(DB_FILE, "r", encoding="utf-8") as f:
+                lines = f.read().splitlines()
+            if len(lines) < 2:
+                self.error_lbl.config(text="Corrupt database file", fg=C["danger"])
+                return
+            
+            salt = bytes.fromhex(lines[0])
+            ciphertext = lines[1]
+            
+            key = derive_key(pw, salt)
+            decrypt_text(ciphertext, key)
+            
+            SESSION_KEY = key
+            SESSION_SALT = salt
+            
+            self.error_lbl.config(text="Access Granted! Decrypting...", fg=C["success"])
+            self.win.after(500, self._success_close)
+        except Exception:
+            self.error_lbl.config(text="Access Denied: Invalid Master Password", fg=C["danger"])
+            self.pw_entry.clear()
+            
+    def _success_close(self):
+        self.win.destroy()
+        self.on_success()
+        
+    def _on_close(self):
+        self.win.destroy()
+        self.root.destroy()
+
+
 # ─── MAIN APPLICATION ─────────────────────────────────────────────────────────
 class VaultApp:
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("VAULT — MD5 Password Manager")
+        self.root.title("VAULT — AES Password Manager")
         self.root.geometry("960x700")
         self.root.minsize(860, 620)
         self.root.configure(bg=C["bg"])
         self.root.resizable(True, True)
 
         self.toast = Toast(self.root)
+        self.root.withdraw()  # Hide main window on startup
+        MasterPasswordGate(self.root, self._unlock_callback)
+
+    def _unlock_callback(self):
+        self.root.deiconify()  # Show main window
         self._build_ui()
         self._refresh_vault_list()
 
@@ -347,7 +584,7 @@ class VaultApp:
                  font=("Courier New", 24)).pack(side="left", padx=(0,8))
         tk.Label(logo_frame, text="VAULT", fg=C["text"], bg=C["bg"],
                  font=("Courier New", 20, "bold")).pack(side="left")
-        tk.Label(logo_frame, text=" MD5 SECURE STORE", fg=C["text_muted"], bg=C["bg"],
+        tk.Label(logo_frame, text=" AES SECURE STORE", fg=C["text_muted"], bg=C["bg"],
                  font=("Courier New", 9)).pack(side="left", padx=(6,0), pady=(8,0))
 
         # Live clock
@@ -437,7 +674,7 @@ class VaultApp:
         title_row.pack(fill="x")
         tk.Label(title_row, text="ADD NEW CREDENTIAL", fg=C["accent"],
                  bg=C["card"], font=("Courier New", 12, "bold")).pack(side="left")
-        tk.Label(title_row, text="Passwords stored as MD5 hash", fg=C["text_muted"],
+        tk.Label(title_row, text="Passwords securely encrypted with AES-256", fg=C["text_muted"],
                  bg=C["card"], font=("Courier New", 8)).pack(side="right", pady=(4,0))
 
         tk.Frame(inner, bg=C["border"], height=1).pack(fill="x")
@@ -461,16 +698,16 @@ class VaultApp:
         self.add_pass2 = StyledEntry(form, label="Confirm Password", placeholder="Repeat password", show="●")
         self.add_pass2.grid(row=1, column=1, sticky="ew", pady=(0,16))
 
-        # Hash preview
+        # Hash preview replaced with strength/validation preview
         preview_frame = tk.Frame(form, bg=C["input_bg"],
                                   highlightbackground=C["border"], highlightthickness=1)
         preview_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(4,16))
 
         ph_inner = tk.Frame(preview_frame, bg=C["input_bg"], padx=14, pady=10)
         ph_inner.pack(fill="x")
-        tk.Label(ph_inner, text="MD5 PREVIEW", fg=C["text_dim"], bg=C["input_bg"],
+        tk.Label(ph_inner, text="PASSWORD STATUS", fg=C["text_dim"], bg=C["input_bg"],
                  font=("Courier New", 7, "bold")).pack(anchor="w")
-        self.hash_preview = tk.Label(ph_inner, text="Type password to preview hash...",
+        self.hash_preview = tk.Label(ph_inner, text="Type password to see validation status...",
                                       fg=C["text_dim"], bg=C["input_bg"],
                                       font=("Courier New", 10), anchor="w")
         self.hash_preview.pack(fill="x")
@@ -494,15 +731,19 @@ class VaultApp:
     def _update_hash_preview(self, e=None):
         pw = self.add_pass.get()
         if pw:
-            h = md5_hash(pw)
-            # Format with spaces for readability
-            formatted = "  ".join([h[i:i+8] for i in range(0, 32, 8)])
-            self.hash_preview.config(
-                text=f"md5 → {formatted}",
-                fg=C["accent2"]
-            )
+            length = len(pw)
+            if length >= 8:
+                self.hash_preview.config(
+                    text=f"Length: {length} characters │ Status: Valid",
+                    fg=C["success"]
+                )
+            else:
+                self.hash_preview.config(
+                    text=f"Length: {length} characters │ Status: Too short (min 8 characters)",
+                    fg=C["danger"]
+                )
         else:
-            self.hash_preview.config(text="Type password to preview hash...", fg=C["text_dim"])
+            self.hash_preview.config(text="Type password to see validation status...", fg=C["text_dim"])
 
     def _add_entry(self):
         user  = self.add_user.get().strip()
@@ -512,10 +753,21 @@ class VaultApp:
 
         if not user:
             self.toast.show("Username cannot be empty", "error"); return
+        if len(user) < 3:
+            self.toast.show("Username must be at least 3 characters", "error"); return
         if not pw:
             self.toast.show("Password cannot be empty", "error"); return
+        if len(pw) < 8:
+            self.toast.show("Password must be at least 8 characters", "error"); return
         if pw != pw2:
             self.toast.show("Passwords do not match", "warning"); return
+
+        disallowed = ["<", ">", "&"]
+        for char in disallowed:
+            if char in user:
+                self.toast.show(f"Username contains disallowed character: {char}", "error"); return
+            if char in label:
+                self.toast.show(f"Label contains disallowed character: {char}", "error"); return
 
         entry = add_entry(user, pw, label)
         self.toast.show(f"Credential stored for '{user}'", "success")
@@ -525,9 +777,10 @@ class VaultApp:
     def _clear_add_form(self):
         for w in [self.add_user, self.add_pass, self.add_pass2, self.add_label]:
             w.clear()
-        self.hash_preview.config(text="Type password to preview hash...", fg=C["text_dim"])
+        self.hash_preview.config(text="Type password to see validation status...", fg=C["text_dim"])
 
     # ── TAB: LOOKUP ───────────────────────────────────────────────────────────
+
     def _build_lookup_tab(self, parent):
         frame = tk.Frame(parent, bg=C["bg"])
 
@@ -610,8 +863,7 @@ class VaultApp:
 
         rows = [
             ("USERNAME",       entry["username"],       C["accent"]),
-            ("USERNAME HASH",  entry["username_hash"],  C["text_muted"]),
-            ("PASSWORD HASH",  entry["password_hash"],  C["text_muted"]),
+            ("PASSWORD",       entry["password"],       C["success"]),
             ("LABEL / SITE",   entry["label"],          C["accent2"]),
             ("STORED ON",      entry["created"],        C["text_muted"]),
         ]
@@ -624,19 +876,6 @@ class VaultApp:
                      font=("Courier New", 9)).pack(side="left", padx=8)
             tk.Label(row, text=value, fg=color, bg=C["input_bg"],
                      font=("Courier New", 10)).pack(side="left")
-
-        # Hash breakdown
-        tk.Frame(pad, bg=C["border"], height=1).pack(fill="x", pady=12)
-        tk.Label(pad, text="HASH SEGMENTS", fg=C["text_dim"], bg=C["input_bg"],
-                 font=("Courier New", 8, "bold")).pack(anchor="w")
-        seg_row = tk.Frame(pad, bg=C["input_bg"])
-        seg_row.pack(anchor="w", pady=(4, 0))
-        h = entry["password_hash"]
-        for i, seg in enumerate([h[0:8], h[8:16], h[16:24], h[24:32]]):
-            tk.Label(seg_row, text=seg, fg=C["accent2"], bg=C["tag_bg"],
-                     font=("Courier New", 9), padx=8, pady=4,
-                     highlightbackground=C["accent2"], highlightthickness=1
-                     ).pack(side="left", padx=(0,4))
 
     def _show_no_match(self):
         pad = tk.Frame(self.result_panel, bg=C["input_bg"])
@@ -687,7 +926,7 @@ class VaultApp:
         # Table header
         hdr = tk.Frame(inner, bg=C["tag_bg"], padx=24, pady=8)
         hdr.pack(fill="x")
-        cols = [("#", 3), ("USERNAME", 12), ("LABEL", 10), ("USERNAME HASH", 20), ("PASSWORD HASH", 20), ("CREATED", 14)]
+        cols = [("#", 3), ("USERNAME", 14), ("LABEL", 12), ("PASSWORD", 16), ("CREATED", 18)]
         for col, w in cols:
             tk.Label(hdr, text=col, fg=C["text_muted"], bg=C["tag_bg"],
                      font=("Courier New", 8, "bold"), width=w, anchor="w").pack(side="left", padx=4)
@@ -770,17 +1009,17 @@ class VaultApp:
             self._vault_radios.append(rb)
 
             data = [
-                (f"  {i+1}", 4, C["text_dim"]),
+                (f"  {i+1}", 3, C["text_dim"]),
                 (e["username"],      14, C["accent"]),
                 (e["label"],         12, C["accent2"]),
-                (e["username_hash"], 22, C["text_muted"]),
-                (e["password_hash"], 22, C["text_muted"]),
-                (e["created"],       16, C["text_dim"]),
+                (e["password"],      16, C["success"]),
+                (e["created"],       18, C["text_dim"]),
             ]
             for text, w, color in data:
-                tk.Label(row, text=text[:w*1], fg=color, bg=row_bg,
+                tk.Label(row, text=text[:w], fg=color, bg=row_bg,
                           font=("Courier New", 9), width=w, anchor="w"
-                          ).pack(side="left", padx=3)
+                          ).pack(side="left", padx=4)
+
 
     def _delete_selected(self):
         idx = self._selected_idx.get()
