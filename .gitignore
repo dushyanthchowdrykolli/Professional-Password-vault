@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.vlt
+*.vlt.bak
+*.xml.bak
+*.log
+*.tmp
+.env
+.venv/
+env/
+venv/
+
