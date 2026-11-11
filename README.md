@@ -1,123 +1,129 @@
 # ◈ VAULT — AES-256-GCM Encrypted Password Manager
-### Dark Luxury Edition · Tier 3 · Python + Tkinter
+### Dark Luxury Edition · Standalone Windows Application · v1.0.0
 
 ---
 
 ## Overview
 
-**VAULT** is a local-first, offline, single-user GUI password manager.  
-All credentials are **encrypted at rest** using AES-256-GCM.  
-The master password is **never stored** — it is used to derive a 32-byte key via Argon2id each time the vault is opened.
+**VAULT** is a local-first, offline, single-user desktop password manager designed for security professionals and privacy-conscious users.
+It runs as a **native standalone Windows application (`VAULT.exe`)** with **no Python installation, no runtime dependencies, and zero network calls**.
+
+All credentials are encrypted at rest using **AES-256-GCM** with keys derived via **Argon2id** (OWASP-compliant parameters). The master password is never stored on disk.
+
+---
+
+## Quick Start (End Users)
+
+### 1. Download & Run
+1. Download `VAULT-1.0.0-win64.zip` from the [Releases](https://github.com/dushyanthchowdrykolli/Professional-Password-vault/releases) page.
+2. Verify the archive integrity against `SHA256SUMS.txt`:
+   ```powershell
+   Get-FileHash VAULT-1.0.0-win64.zip -Algorithm SHA256
+   ```
+3. Extract the ZIP folder to any directory (e.g. `C:\Users\<You>\AppData\Local\Programs\VAULT` or your Desktop).
+4. Double-click **`VAULT.exe`**.
+
+> ℹ️ **Windows Defender / SmartScreen Notice:**  
+> Because this application is distributed independently without a costly commercial Extended Validation (EV) certificate, Windows SmartScreen may display:  
+> *"Windows protected your PC — Microsoft Defender SmartScreen prevented an unrecognized app from starting."*  
+> Click **"More info"**, then click **"Run anyway"**.
+
+---
+
+## Where Your Data Lives
+
+Your data is **completely isolated** from the application binaries:
+
+```
+Windows Data Location:
+%APPDATA%\VAULT\vault_database.vlt
+```
+
+- **Upgrades & Deletions:** Deleting, replacing, or reinstalling the application directory **will never touch or delete your vault database**.
+- **Audit Logs:** Diagnostic and security events (e.g. unlocks, lockouts, entry updates) are logged to `%APPDATA%\VAULT\vault.log` with a rotating 1 MB limit (max 3 backups). Passwords, keys, salts, and decrypted content are **never logged**.
+- **Lock Protection:** An OS-level file lock (`%APPDATA%\VAULT\vault.lock`) prevents multiple instances from running concurrently on the same vault.
+
+---
+
+## How to Update
+
+When a newer version of VAULT is released:
+
+1. **Exit VAULT** completely.
+2. Download the new `VAULT-<new-version>-win64.zip`.
+3. **Delete the old application folder** completely.  
+   *(Always delete the old folder before extracting the new one to prevent orphaned `.dll` files from previous builds).*
+4. **Extract the new archive** in its place.
+5. Launch the new **`VAULT.exe`**.
+
+### Automated Safety on Upgrade
+On the first launch of a new version:
+- VAULT automatically creates a timestamped pre-update backup of your database:
+  `%APPDATA%\VAULT\vault.pre-update-<old>-to-<new>.bak`
+- A toast notification confirms: *"Updated to v<new-version>"*.
+- Your existing master password and saved credentials remain completely intact.
 
 ---
 
 ## Security Architecture
 
-| Property | Implementation |
+| Feature | Implementation |
 |---|---|
-| KDF | Argon2id — `time=2`, `memory=64 MiB`, `parallelism=4`, `hash_len=32` |
-| Cipher | AES-256-GCM (authenticated encryption — wrong key → decryption error) |
-| Storage | Encrypted JSON blob; only KDF params + salt stored in plaintext header |
-| Nonce | 12-byte random nonce prepended to each ciphertext — unique per save |
-| Writes | Atomic (`os.replace`) + 1 `.bak` copy — crash-safe |
-| Reveal & Edit | Requires master password re-entry; revealed password auto-hides after 15 seconds |
-| Clipboard | Copy button on reveal modal; auto-clears after 20 seconds if unchanged |
-| Auto-lock | Locks after 5 minutes of inactivity; also locks when window is minimized |
-| Back-off | Increasing delay (1 s, 2 s, 4 s…) + 60 s lockout after 5 wrong attempts |
-| Password Gen | Cryptographically secure random password generator using Python's `secrets` module |
-| Master Key Change | Full vault re-encryption using new salt and new Argon2id derived key |
-| Backups | Encrypted `.vlt` export and import with conflict-free merge or full replace |
-| Logging | Rotating file handler (`vault.log`, 1 MB, 3 backups) — events only |
+| **Cipher** | AES-256-GCM (Authenticated Encryption with Associated Data) |
+| **KDF** | Argon2id — `time=2`, `memory=64 MiB`, `parallelism=4`, `hash_len=32` |
+| **Storage** | Encrypted JSON payload with unencrypted salt and KDF parameters in the file header |
+| **Nonce** | 12-byte random cryptographic nonce generated per atomic save |
+| **Integrity** | Tampering or wrong password fails GCM tag authentication directly |
+| **Schema Protection** | Embedded `schema_version` with automatic forward migrations and downgrade refusal |
+| **Single-Instance** | Kernel file locking via `msvcrt` preventing concurrent database writes |
+| **Auto-Lock** | Automatic lock on 5-minute inactivity and window minimize |
+| **Clipboard** | 20-second auto-clear timer verifying content before clearing |
+| **Password Generator**| Python `secrets` CSPRNG guaranteeing uppercase, lowercase, numbers, and symbols |
+| **Backups** | Encrypted export (`.vlt`) and import with conflict-free merge or full replace options |
 
 ---
 
 ## Security Notes & Limitations
 
-> ⚠️ **Memory Wiping:** Python cannot reliably zero-fill strings or bytes in memory due to CPython's string interning, garbage collection, and reference counting. Dropping references on lock or exit is **best-effort only**. This is a known, fundamental CPython constraint.
+> ⚠️ **Memory Wiping:** Python cannot guarantee zero-filling of freed strings or memory buffers due to CPython's string interning and garbage collection. Dropping references on lock or exit is **best-effort only**. This is an intrinsic CPython characteristic.
 
-> ⚠️ **Clipboard Stores:** The Windows Clipboard History (`Win+V`) and third-party clipboard managers (e.g. Ditto) may capture passwords copied via the "Copy" button. Our 20-second auto-clear only removes the value from the active OS clipboard buffer — it cannot purge third-party history stores.
+> ⚠️ **OS Clipboard History:** Windows Clipboard History (`Win+V`) and third-party tools (e.g. Ditto) hook operating system clipboard events. Our 20-second clear empties the active clipboard buffer, but cannot erase historic entries captured by external tools.
 
-> ⚠️ **No Network Calls:** VAULT is strictly offline. It never makes HTTP requests, dials out, or collects telemetry.
-
----
-
-## Requirements
-
-| Package | Version |
-|---|---|
-| Python | 3.9 or higher |
-| tkinter | Bundled with standard Python |
-| cryptography | ≥ 42.0.0 |
-| argon2-cffi | ≥ 23.1.0 |
-
-### Install dependencies
-
-```bash
-pip install -r requirements.txt
-```
+> ⚠️ **Zero Network Surface:** VAULT is strictly offline. It contains no web server, no network callers, no update checkers, and no telemetry.
 
 ---
 
-## How to Run
+## Building from Source (Developers)
 
-```bash
-python password_vault.py
-```
+### Requirements
+- Windows 10/11 x64
+- Python 3.9+ (Python 3.11+ recommended)
 
-Or press **F5** in Spyder (set Graphics backend to **Automatic** under Tools → Preferences if the window freezes).
+### Build Steps
+1. Install dependencies:
+   ```powershell
+   pip install -r requirements.txt
+   ```
+2. Run test suites:
+   ```powershell
+   python tests_tier2.py
+   python tests_tier3.py
+   python tests_tier4.py
+   python password_vault.py --selftest
+   ```
+3. Execute the automated build script:
+   ```powershell
+   python build.py
+   ```
+4. Output artifacts are created in `release/`:
+   - `VAULT-1.0.0-win64.zip`
+   - `SHA256SUMS.txt`
 
-### Run unit tests
-
-```bash
-python tests_tier2.py
-python tests_tier3.py
-```
-
----
-
-## Tabs & Features
-
-| Tab | Purpose |
-|---|---|
-| `⊕ ADD ENTRY` | Store a new credential (username, password, label). Includes live strength meter and `🎲 GENERATE RANDOM PASSWORD` button powered by `secrets`. |
-| `⌕ RETRIEVE` | Search by username or label. Passwords always masked. Click **REVEAL** → re-enter master password → option to **COPY** (auto-clears in 20 s) and inline plaintext reveals for 15 s. |
-| `▤ VAULT` | Browse all entries via styled **`ttk.Treeview`** (passwords always masked). Live dynamic search/filter across website/label and username. Select entries to **REVEAL**, **EDIT** (requires master password re-auth), or **DELETE**. Double-click any row to reveal. |
-| `Header Utilities` | **KEY** (Change Master Password & re-encrypt vault), **EXPORT** (save encrypted `.vlt` backup), **IMPORT** (decrypt & import backup with merge/replace options). |
-
----
-
-## Colour Palette (Dark Luxury)
-
-| Role | Hex | Description |
-|---|---|---|
-| Background | `#0D0F1A` | Midnight navy |
-| Card | `#1A1F38` | Component background |
-| Border | `#252A45` | Subtle container border |
-| Accent Gold | `#C9A84C` | Primary actions & logos |
-| Accent Violet | `#7B61FF` | Secondary actions & modals |
-| Success | `#4EC994` | Emerald green |
-| Danger | `#E05C7A` | Rose red |
-| Text | `#E8E6F0` | Soft white |
+### Optional Inno Setup Installer
+If you have [Inno Setup 6+](https://jrsoftware.org/isinfo.php) installed, compile `installer.iss` to produce `VAULT-Setup-1.0.0.exe` for per-user installation.
 
 ---
 
-## Project Structure
+## License
 
-```
-password_vault.py         # Single-file application — UI, crypto, and logic
-tests_tier2.py            # Unit tests for validation, sanitization, and lockout
-tests_tier3.py            # Unit tests for password generator and entry editing
-requirements.txt          # pip dependencies
-vault_database.vlt        # Auto-created encrypted vault (home directory)
-vault.log                 # Rotating event log (no secrets ever logged)
-README.md
-```
-
----
-
-## Tier Roadmap
-
-- [x] **Tier 1** — Encryption core, master password gate, Retrieve tab, wrong-password back-off, atomic writes
-- [x] **Tier 2** — Input validation, auto-lock on inactivity/minimize, clipboard copy + auto-clear, named constants, deduplicated UI cards, Theme class, rotating logging, shutdown cleanup
-- [x] **Tier 3** — Edit entries with re-auth, dynamic search/filter across fields, ttk.Treeview, `secrets` password generator, change master password, encrypted backup export/import
-- [ ] **Tier 4** — User-defined extra additions (placeholder)
+This project is licensed under the MIT License. Built for educational, personal, and professional security use.

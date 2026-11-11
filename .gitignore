@@ -1,13 +1,26 @@
+# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
+
+# PyInstaller build artifacts
+build/
+dist/
+release/
+file_version_info.txt
+
+# Vault databases, backups, and logs
 *.vlt
 *.vlt.bak
 *.xml.bak
 *.log
 *.tmp
+*.lock
+.vault_data/
+
+# Environments
 .env
 .venv/
 env/
 venv/
-
+ENV/

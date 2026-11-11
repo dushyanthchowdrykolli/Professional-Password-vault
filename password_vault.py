@@ -1,7 +1,7 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
 ║          VAULT — AES-256-GCM Encrypted Password Manager      ║
-║      Dark Luxury Edition | Tier 3 — Advanced Features        ║
+║      Dark Luxury Edition | Tier 4 — Standalone Windows App   ║
 ╚══════════════════════════════════════════════════════════════╝
 
 Security model:
@@ -16,13 +16,16 @@ Security model:
     after LOCKOUT_AFTER_FAILS failures.
   • Atomic writes (write tmp → os.replace) + one .bak copy.
 
-Tier 3 additions:
-  18. Edit an existing entry with master password re-authentication.
-  19. Search / filter field dynamically across website/label and username.
-  20. Replaced manual canvas list with styled ttk.Treeview (passwords always masked).
-  21. Cryptographically secure random password generator using stdlib `secrets`.
-  22. Change master password flow (re-encrypts the entire vault with fresh salt & key).
-  23. Encrypted export and import backup (.vlt) with merge/replace options.
+Tier 4 standalone additions:
+  24. Single source of truth for versions (version.py) & About dialog.
+  25. App decoupled from user data (%APPDATA%\\VAULT\\); legacy vault copy migration.
+  26. Encrypted vault schema versioning and downgrade refusal protection.
+  27. Single-instance protection via OS-level file lock (msvcrt).
+  28. Frozen-app compatibility (resource_path, windowed global exception hook).
+  29. Built-in --selftest mode for build verification and diagnostics.
+  30. PyInstaller onedir reproducible build tooling.
+  31. Release packaging with SHA256 checksums and end-user guidance.
+  32. Safe manual update handling with pre-update backups.
 
 Known limitations (Python-level, not fixable):
   • Python cannot reliably wipe secrets from memory (CPython string interning,
@@ -30,10 +33,6 @@ Known limitations (Python-level, not fixable):
   • The Windows clipboard history (Win+V) and third-party clipboard managers
     may retain copies of revealed passwords after our auto-clear fires. We
     cannot control those stores.
-
-Dependencies:
-    pip install cryptography argon2-cffi
-    (stdlib only for all other features)
 """
 
 # ─── STANDARD LIBRARY ────────────────────────────────────────────────────────
@@ -46,32 +45,92 @@ import logging.handlers
 import os
 import re
 import secrets
+import shutil
 import string
+import sys
 import time
 import unicodedata
 from datetime import datetime
+from pathlib import Path
 
 # ─── THIRD-PARTY (crypto) ────────────────────────────────────────────────────
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.exceptions import InvalidTag
 from argon2.low_level import hash_secret_raw, Type as Argon2Type
 
+# ─── VERSION METADATA ────────────────────────────────────────────────────────
+from version import (
+    APP_VERSION,
+    VAULT_SCHEMA_VERSION,
+    PRODUCT_NAME,
+    COMPANY_NAME,
+    FILE_DESCRIPTION,
+    COPYRIGHT,
+)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  FROZEN APP & PATH HELPERS (Item 28)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def resource_path(relative_path: str) -> str:
+    """Get absolute path to resource, working both in dev and when PyInstaller frozen."""
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        base_path = sys._MEIPASS
+    else:
+        base_path = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base_path, relative_path)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  USER DATA FOLDER ISOLATION (Item 25)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_data_dir() -> str:
+    """Return the per-user data directory (%APPDATA%\\VAULT on Windows)."""
+    if "--selftest" in sys.argv:
+        import tempfile
+        return tempfile.gettempdir()
+
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        target = os.path.join(appdata, "VAULT")
+    else:
+        target = os.path.join(os.path.expanduser("~"), ".vault")
+    try:
+        os.makedirs(target, exist_ok=True)
+        return target
+    except OSError:
+        # Fallback for restricted/sandboxed environments to ensure crash-free execution
+        fallback = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".vault_data")
+        try:
+            os.makedirs(fallback, exist_ok=True)
+            return fallback
+        except OSError:
+            import tempfile
+            return tempfile.gettempdir()
+
+
+DATA_DIR   = get_data_dir()
+DB_FILE    = os.path.join(DATA_DIR, "vault_database.vlt")
+LOG_FILE   = os.path.join(DATA_DIR, "vault.log")
+LOCK_FILE  = os.path.join(DATA_DIR, "vault.lock")
+STATE_FILE = os.path.join(DATA_DIR, "app_state.json")
+
+# Legacy paths from Tiers 1-3 stored in user home
+LEGACY_TIER13_FILE = os.path.join(os.path.expanduser("~"), "vault_database.vlt")
+LEGACY_XML_FILE    = os.path.join(os.path.expanduser("~"), "vault_database.xml")
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-# ── File paths ────────────────────────────────────────────────────────────────
-DB_FILE        = os.path.join(os.path.expanduser("~"), "vault_database.vlt")
-DB_LEGACY      = os.path.join(os.path.expanduser("~"), "vault_database.xml")
-LOG_FILE       = os.path.join(os.path.expanduser("~"), "vault.log")
-
-# ── Vault format ──────────────────────────────────────────────────────────────
+# ── Vault format & Argon2id KDF ──────────────────────────────────────────────
 VAULT_FORMAT_VERSION = 1
 
-# ── Argon2id KDF ─────────────────────────────────────────────────────────────
 ARGON2_TIME_COST    = 2        # iterations
-ARGON2_MEMORY_KIB   = 65536   # 64 MiB; raise to 102400 on beefy hardware
+ARGON2_MEMORY_KIB   = 65536   # 64 MiB
 ARGON2_PARALLELISM  = 4
 ARGON2_HASH_LEN     = 32      # bytes → AES-256 key
 ARGON2_SALT_LEN     = 16      # bytes
@@ -184,6 +243,114 @@ log = _setup_logging()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  SINGLE INSTANCE PROTECTION (Item 27)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class SingleInstanceLock:
+    """
+    Enforces a single running instance per data folder using an OS file lock.
+    On Windows, uses msvcrt.locking. Stale locks from crashes automatically
+    clear because the kernel releases file locks on process exit.
+    """
+    def __init__(self, lock_path: str):
+        self.lock_path = lock_path
+        self.fh = None
+
+    def acquire(self) -> bool:
+        try:
+            self.fh = open(self.lock_path, "a+b")
+            self.fh.seek(0)
+            if sys.platform == "win32":
+                import msvcrt
+                msvcrt.locking(self.fh.fileno(), msvcrt.LK_NBLCK, 1)
+            return True
+        except (BlockingIOError, PermissionError, OSError):
+            if self.fh:
+                try:
+                    self.fh.close()
+                except Exception:
+                    pass
+                self.fh = None
+            return False
+
+    def release(self):
+        if self.fh:
+            try:
+                if sys.platform == "win32":
+                    import msvcrt
+                    self.fh.seek(0)
+                    msvcrt.locking(self.fh.fileno(), msvcrt.LK_UNLCK, 1)
+            except Exception:
+                pass
+            try:
+                self.fh.close()
+            except Exception:
+                pass
+            self.fh = None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SCHEMA MIGRATIONS & DOWNGRADE PROTECTION (Item 26)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class SchemaDowngradeError(Exception):
+    """Raised when vault file schema is newer than supported by this app."""
+    pass
+
+
+# Migration registry: version_from -> callable(entries) -> (migrated_entries, new_version)
+MIGRATIONS = {
+    # e.g., 1: migrate_v1_to_v2
+}
+
+
+def _process_vault_payload(raw_payload: dict | list) -> tuple[list[dict], int]:
+    """
+    Extracts entries and validates schema version.
+    Supports backward compatibility with Tier 1-3 list payloads.
+    Refuses newer schemas with SchemaDowngradeError.
+    """
+    if isinstance(raw_payload, list):
+        stored_schema = 1
+        entries = raw_payload
+    elif isinstance(raw_payload, dict):
+        stored_schema = raw_payload.get("schema_version", 1)
+        entries = raw_payload.get("entries", [])
+    else:
+        raise ValueError("Invalid vault payload format.")
+
+    if stored_schema > VAULT_SCHEMA_VERSION:
+        raise SchemaDowngradeError(
+            "This vault was created by a newer version of VAULT. Please update the app."
+        )
+
+    if stored_schema < VAULT_SCHEMA_VERSION:
+        # Pre-migration backup
+        pre_bak = os.path.join(
+            DATA_DIR, f"vault.pre-migration-v{stored_schema}-to-v{VAULT_SCHEMA_VERSION}.bak"
+        )
+        try:
+            shutil.copy2(DB_FILE, pre_bak)
+            log.info("Created pre-migration backup at %s", pre_bak)
+        except Exception as exc:
+            log.warning("Could not create pre-migration backup: %s", exc)
+
+        current_v = stored_schema
+        while current_v < VAULT_SCHEMA_VERSION:
+            migrator = MIGRATIONS.get(current_v)
+            if migrator:
+                entries, current_v = migrator(entries)
+                log.info("Migrated vault schema from v%d to v%d.", current_v - 1, current_v)
+            else:
+                current_v += 1
+
+        # Re-save with updated schema
+        save_vault(entries)
+
+    return entries, VAULT_SCHEMA_VERSION
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  SESSION STATE
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -237,7 +404,7 @@ def _build_header(salt: bytes) -> dict:
 
 
 def load_vault() -> list[dict]:
-    """Decrypt and return all entries."""
+    """Decrypt and return all entries with schema checks."""
     global _session_key
     if _session_key is None:
         raise RuntimeError("Vault is locked — call unlock_vault() first.")
@@ -258,21 +425,29 @@ def load_vault() -> list[dict]:
     except Exception as exc:
         log.error("Vault decryption error: %s", type(exc).__name__)
         raise
+
     try:
-        return json.loads(plaintext.decode("utf-8"))
+        raw_payload = json.loads(plaintext.decode("utf-8"))
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         log.error("Vault JSON decode error: %s", type(exc).__name__)
         raise ValueError("Vault data is corrupt.") from exc
 
+    entries, _ = _process_vault_payload(raw_payload)
+    return entries
+
 
 def save_vault(entries: list[dict]) -> None:
-    """Encrypt all entries and atomically write the vault file."""
+    """Encrypt all entries with schema envelope and atomically write vault file."""
     global _session_key, _session_salt
     if _session_key is None or _session_salt is None:
         raise RuntimeError("Vault is locked — cannot save.")
     try:
+        payload = {
+            "schema_version": VAULT_SCHEMA_VERSION,
+            "entries": entries,
+        }
         blob = _aes_encrypt(
-            json.dumps(entries, ensure_ascii=False).encode("utf-8"),
+            json.dumps(payload, ensure_ascii=False).encode("utf-8"),
             _session_key,
         )
         content  = json.dumps(_build_header(_session_salt)) + "\n" + blob + "\n"
@@ -288,7 +463,7 @@ def save_vault(entries: list[dict]) -> None:
             except OSError as exc:
                 log.warning("Could not rotate backup: %s", exc)
         os.replace(tmp_path, DB_FILE)
-        log.info("Vault saved — %d entries.", len(entries))
+        log.info("Vault saved — %d entries (schema v%d).", len(entries), VAULT_SCHEMA_VERSION)
     except OSError as exc:
         log.error("Vault save failed (I/O): %s", exc)
         raise
@@ -298,7 +473,7 @@ def save_vault(entries: list[dict]) -> None:
 
 
 def unlock_vault(master_password: str) -> None:
-    """Derive session key from an existing vault file and verify it."""
+    """Derive session key from existing vault file and verify it."""
     global _session_key, _session_salt
     try:
         with open(DB_FILE, "r", encoding="utf-8") as fh:
@@ -316,7 +491,18 @@ def unlock_vault(master_password: str) -> None:
 
     key = _derive_key(master_password, salt)
     if len(lines) >= 2 and lines[1].strip():
-        _aes_decrypt(lines[1].strip(), key)
+        plaintext = _aes_decrypt(lines[1].strip(), key)
+        # Check for downgrade refusal
+        try:
+            raw = json.loads(plaintext.decode("utf-8"))
+            if isinstance(raw, dict):
+                v = raw.get("schema_version", 1)
+                if v > VAULT_SCHEMA_VERSION:
+                    raise SchemaDowngradeError(
+                        "This vault was created by a newer version of VAULT. Please update the app."
+                    )
+        except json.JSONDecodeError:
+            pass
 
     _session_key  = key
     _session_salt = salt
@@ -331,7 +517,7 @@ def initialize_vault(master_password: str) -> None:
     _session_key  = key
     _session_salt = salt
     save_vault([])
-    log.info("New vault initialized.")
+    log.info("New vault initialized in %s.", DATA_DIR)
 
 
 def lock_vault() -> None:
@@ -355,7 +541,6 @@ def add_vault_entry(label: str, username: str, password: str) -> None:
 
 
 def edit_vault_entry(index: int, label: str, username: str, password: str) -> None:
-    """Edit an existing vault entry at index."""
     entries = load_vault()
     if 0 <= index < len(entries):
         entries[index]["label"]    = label
@@ -391,8 +576,12 @@ def change_master_password(current_password: str, new_password: str) -> None:
     new_salt = os.urandom(ARGON2_SALT_LEN)
     new_key  = _derive_key(new_password, new_salt)
 
+    payload = {
+        "schema_version": VAULT_SCHEMA_VERSION,
+        "entries": entries,
+    }
     blob = _aes_encrypt(
-        json.dumps(entries, ensure_ascii=False).encode("utf-8"),
+        json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         new_key,
     )
     header   = _build_header(new_salt)
@@ -417,7 +606,84 @@ def change_master_password(current_password: str, new_password: str) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  RANDOM PASSWORD GENERATOR (Item 21)
+#  LEGACY MIGRATION & APP UPDATE LIFECYCLE (Items 25 & 32)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _check_legacy_migration() -> str | None:
+    """
+    On first run with user data dir:
+    If DB_FILE does not exist, check if a Tier 1-3 vault exists in ~:
+    Copy it to %APPDATA%\\VAULT\\vault_database.vlt (NEVER move or delete original).
+    """
+    if os.path.exists(DB_FILE):
+        return None
+
+    if os.path.exists(LEGACY_TIER13_FILE):
+        try:
+            shutil.copy2(LEGACY_TIER13_FILE, DB_FILE)
+            log.info("Copied legacy Tier 1-3 vault from %s to %s", LEGACY_TIER13_FILE, DB_FILE)
+            return "Migrated existing vault to user data folder."
+        except Exception as exc:
+            log.error("Failed to copy legacy vault: %s", exc)
+    return None
+
+
+def _check_app_version_update() -> str | None:
+    """
+    Detects app version upgrades. On upgrade:
+    - Logs transition
+    - Creates timestamped pre-update backup: vault.pre-update-<old>-to-<new>.bak
+    - Keeps only the last 3 pre-update backups
+    """
+    state_msg = None
+    state = {}
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                state = json.load(f)
+        except Exception:
+            state = {}
+
+    last_ver = state.get("last_seen_version")
+    if last_ver and last_ver != APP_VERSION:
+        log.info("App upgraded from v%s to v%s.", last_ver, APP_VERSION)
+        state_msg = f"Updated to v{APP_VERSION}"
+
+        if os.path.exists(DB_FILE):
+            bak_name = f"vault.pre-update-{last_ver}-to-{APP_VERSION}.bak"
+            bak_path = os.path.join(DATA_DIR, bak_name)
+            try:
+                shutil.copy2(DB_FILE, bak_path)
+                log.info("Created pre-update backup at %s", bak_path)
+            except Exception as exc:
+                log.warning("Could not create pre-update backup: %s", exc)
+
+            # Keep only the last 3 pre-update backups
+            try:
+                baks = [
+                    f for f in os.listdir(DATA_DIR)
+                    if f.startswith("vault.pre-update-") and f.endswith(".bak")
+                ]
+                baks.sort(key=lambda f: os.path.getmtime(os.path.join(DATA_DIR, f)))
+                while len(baks) > 3:
+                    old_f = baks.pop(0)
+                    os.remove(os.path.join(DATA_DIR, old_f))
+            except Exception:
+                pass
+
+    try:
+        state["last_seen_version"] = APP_VERSION
+        state["last_launched"] = datetime.now().isoformat()
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2)
+    except Exception as exc:
+        log.warning("Could not update app state: %s", exc)
+
+    return state_msg
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  RANDOM PASSWORD GENERATOR
 # ══════════════════════════════════════════════════════════════════════════════
 
 def generate_password(length: int = DEFAULT_GEN_PW_LEN, include_symbols: bool = True) -> str:
@@ -430,7 +696,6 @@ def generate_password(length: int = DEFAULT_GEN_PW_LEN, include_symbols: bool = 
     symbols = "!@#$%^&*()-_=+[]{}|;:,.<>?" if include_symbols else ""
     pool    = lowers + uppers + digits + symbols
 
-    # Guarantee at least one character from each character category
     guaranteed = [
         secrets.choice(lowers),
         secrets.choice(uppers),
@@ -442,7 +707,6 @@ def generate_password(length: int = DEFAULT_GEN_PW_LEN, include_symbols: bool = 
     remaining = [secrets.choice(pool) for _ in range(length - len(guaranteed))]
     combo     = guaranteed + remaining
 
-    # Secure shuffle using Fisher-Yates with secrets.randbelow
     for i in range(len(combo) - 1, 0, -1):
         j = secrets.randbelow(i + 1)
         combo[i], combo[j] = combo[j], combo[i]
@@ -678,7 +942,7 @@ class Toast:
 
         self.root.update_idletasks()
         win.geometry(
-            f"+{self.root.winfo_x() + self.root.winfo_width() - 320}"
+            f"+{self.root.winfo_x() + self.root.winfo_width() - 340}"
             f"+{self.root.winfo_y() + self.root.winfo_height() - 90}"
         )
 
@@ -745,11 +1009,11 @@ class MasterPasswordGate:
         self._fail_count  = 0
         self._locked_until = 0.0
 
-        self._legacy = os.path.exists(DB_LEGACY) and not os.path.exists(DB_FILE)
+        self._legacy = os.path.exists(LEGACY_XML_FILE) and not os.path.exists(DB_FILE)
         self._is_new = not os.path.exists(DB_FILE)
 
         self.win = tk.Toplevel(root)
-        self.win.title("VAULT — Security Gateway")
+        self.win.title(f"{PRODUCT_NAME} — Security Gateway")
         self.win.configure(bg=T.bg)
         self.win.resizable(False, False)
         h = 420 if (self._is_new or self._legacy) else 360
@@ -770,7 +1034,7 @@ class MasterPasswordGate:
         hdr.pack(fill="x", pady=(0, 10))
         tk.Label(hdr, text="◈", fg=T.accent, bg=T.bg, font=FONT_ICON).pack(side="left", padx=(0, 6))
         prefix = "🔒  " if self.is_relock else ""
-        tk.Label(hdr, text=f"{prefix}VAULT GATEWAY", fg=T.text, bg=T.bg,
+        tk.Label(hdr, text=f"{prefix}{PRODUCT_NAME} GATEWAY", fg=T.text, bg=T.bg,
                  font=FONT_HEADING_SM).pack(side="left")
         tk.Frame(outer, bg=T.accent, height=HEIGHT_SEP).pack(fill="x", pady=(0, 15))
 
@@ -825,11 +1089,11 @@ class MasterPasswordGate:
             self.err_lbl.config(text=errs[0]); return
 
         if self._legacy:
-            bak = DB_LEGACY + ".bak"
+            bak = LEGACY_XML_FILE + ".bak"
             try:
                 if os.path.exists(bak):
                     os.remove(bak)
-                os.rename(DB_LEGACY, bak)
+                os.rename(LEGACY_XML_FILE, bak)
                 log.info("Legacy XML vault backed up to %s", bak)
             except OSError as exc:
                 log.warning("Could not rename legacy vault: %s", exc)
@@ -885,6 +1149,8 @@ class MasterPasswordGate:
             self._fail_count = 0
             self.err_lbl.config(text="Access Granted! Loading…", fg=T.success)
             self.win.after(500, self._succeed)
+        except SchemaDowngradeError as exc:
+            self.err_lbl.config(text=str(exc), fg=T.danger)
         except InvalidTag:
             self._fail_count += 1
             log.warning("Failed unlock attempt #%d.", self._fail_count)
@@ -916,6 +1182,72 @@ class MasterPasswordGate:
     def _on_close(self):
         self.win.destroy()
         self.root.destroy()
+
+
+class AboutDialog:
+    """About dialog showing application & schema version and data folder path (Item 24)."""
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.win  = tk.Toplevel(root)
+        self.win.title(f"About {PRODUCT_NAME}")
+        self.win.configure(bg=T.bg)
+        self.win.resizable(False, False)
+        self.win.update_idletasks()
+        sw, sh = self.win.winfo_screenwidth(), self.win.winfo_screenheight()
+        self.win.geometry(f"500x380+{(sw-500)//2}+{(sh-380)//2}")
+        self.win.grab_set()
+        self._build()
+
+    def _build(self):
+        outer = tk.Frame(self.win, bg=T.bg, padx=PAD_OUTER, pady=PAD_OUTER)
+        outer.pack(fill="both", expand=True)
+
+        hdr = tk.Frame(outer, bg=T.bg)
+        hdr.pack(fill="x", pady=(0, 6))
+        tk.Label(hdr, text="◈", fg=T.accent, bg=T.bg, font=FONT_ICON_LG).pack(side="left", padx=(0, 8))
+        tk.Label(hdr, text=f"{PRODUCT_NAME} v{APP_VERSION}", fg=T.text, bg=T.bg, font=FONT_LOGO).pack(side="left")
+
+        tk.Frame(outer, bg=T.accent, height=HEIGHT_SEP).pack(fill="x", pady=(8, 12))
+
+        card = tk.Frame(outer, bg=T.card, padx=16, pady=12,
+                        highlightbackground=T.border, highlightthickness=1)
+        card.pack(fill="both", expand=True, pady=(0, 12))
+
+        lines = [
+            ("Application Version", f"v{APP_VERSION}"),
+            ("Vault Schema Version", f"v{VAULT_SCHEMA_VERSION}"),
+            ("Security Cipher", "AES-256-GCM (Authenticated)"),
+            ("Key Derivation", "Argon2id (OWASP 64 MiB, 2 iterations)"),
+            ("Data Directory", DATA_DIR),
+        ]
+        for lbl, val in lines:
+            row = tk.Frame(card, bg=T.card)
+            row.pack(fill="x", pady=3)
+            tk.Label(row, text=f"{lbl}:", fg=T.text_muted, bg=T.card,
+                     font=(FONT_MONO, 8, "bold"), width=22, anchor="w").pack(side="left")
+            tk.Label(row, text=val, fg=T.accent if "Version" in lbl else T.text, bg=T.card,
+                     font=(FONT_MONO, 8), wraplength=280, justify="left", anchor="w").pack(side="left")
+
+        btn_row = tk.Frame(outer, bg=T.bg)
+        btn_row.pack(fill="x")
+        GoldButton(btn_row, "📂  OPEN DATA FOLDER", command=self._open_data_folder, variant="ghost"
+                   ).pack(side="left", padx=(0, 6))
+        GoldButton(btn_row, "CLOSE", command=self._close, variant="primary"
+                   ).pack(side="right")
+
+    def _open_data_folder(self):
+        try:
+            if sys.platform == "win32":
+                os.startfile(DATA_DIR)
+            else:
+                import subprocess
+                subprocess.run(["xdg-open", DATA_DIR], check=False)
+        except Exception as exc:
+            log.warning("Could not open data folder: %s", exc)
+
+    def _close(self):
+        self.win.grab_release()
+        self.win.destroy()
 
 
 class ReAuthModal:
@@ -999,7 +1331,6 @@ class ReAuthModal:
                 self._copy_btn.pack(side="left")
             log.info("Re-authentication succeeded (hint: '%s').", self._label_hint)
             self.on_success(self._secret)
-            # If not a reveal dialog with copy, close immediately
             if not self._clipboard_cb or self._secret is None:
                 self.win.grab_release()
                 self.win.destroy()
@@ -1041,7 +1372,7 @@ class ReAuthModal:
 
 
 class EditEntryModal:
-    """Modal to edit an existing credential (Item 18)."""
+    """Modal to edit an existing credential."""
     def __init__(self, root: tk.Tk, entry_idx: int, entry: dict, on_saved_cb, toast: Toast):
         self.root        = root
         self.entry_idx   = entry_idx
@@ -1079,7 +1410,6 @@ class EditEntryModal:
         self.edit_pass.pack(fill="x", pady=(0, 8))
         self.edit_pass.set_text(self.entry.get("password", ""))
 
-        # Generator & Mask toggle bar
         opt_bar = tk.Frame(outer, bg=T.bg)
         opt_bar.pack(fill="x", pady=(0, 12))
         GoldButton(opt_bar, "🎲  GENERATE NEW PASSWORD", variant="ghost",
@@ -1137,7 +1467,7 @@ class EditEntryModal:
 
 
 class ChangeMasterPasswordModal:
-    """Modal to re-encrypt the entire vault with a new master password (Item 22)."""
+    """Modal to re-encrypt the entire vault with a new master password."""
     def __init__(self, root: tk.Tk, toast: Toast):
         self.root  = root
         self.toast = toast
@@ -1210,7 +1540,7 @@ class ChangeMasterPasswordModal:
 
 
 class ImportBackupModal:
-    """Modal to decrypt and import an encrypted .vlt backup (Item 23)."""
+    """Modal to decrypt and import an encrypted .vlt backup."""
     def __init__(self, root: tk.Tk, filepath: str, toast: Toast, on_success_cb):
         self.root          = root
         self.filepath      = filepath
@@ -1289,14 +1619,24 @@ class ImportBackupModal:
             key  = _derive_key(pw, salt)
             blob = lines[1].strip()
 
-            plaintext   = _aes_decrypt(blob, key)
-            new_entries = json.loads(plaintext.decode("utf-8"))
+            plaintext = _aes_decrypt(blob, key)
+            raw = json.loads(plaintext.decode("utf-8"))
+            if isinstance(raw, list):
+                new_entries = raw
+            elif isinstance(raw, dict):
+                v = raw.get("schema_version", 1)
+                if v > VAULT_SCHEMA_VERSION:
+                    raise SchemaDowngradeError(
+                        "Backup was created by a newer version of VAULT. Please update the app."
+                    )
+                new_entries = raw.get("entries", [])
+            else:
+                raise ValueError("Corrupt backup format.")
 
             curr_entries = load_vault()
             if self.mode_var.get() == "replace":
                 merged = new_entries
             else:
-                # Merge: avoid identical duplicates (same label, username, password)
                 merged = list(curr_entries)
                 existing_keys = {(e.get("label"), e.get("username"), e.get("password")) for e in curr_entries}
                 for ne in new_entries:
@@ -1310,6 +1650,8 @@ class ImportBackupModal:
             self.toast.show(f"Imported successfully — {len(merged)} total credentials.", "success")
             self.on_success_cb()
             self._close()
+        except SchemaDowngradeError as exc:
+            self.err_lbl.config(text=str(exc))
         except InvalidTag:
             self.err_lbl.config(text="Incorrect password or corrupted backup.")
         except Exception as exc:
@@ -1328,11 +1670,19 @@ class ImportBackupModal:
 class VaultApp:
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("VAULT — AES-256-GCM Encrypted Password Manager")
+        self.root.title(f"{PRODUCT_NAME} v{APP_VERSION} — AES-256-GCM Encrypted Password Manager")
         self.root.geometry("1020x740")
         self.root.minsize(920, 640)
         self.root.configure(bg=T.bg)
         self.root.resizable(True, True)
+
+        # Set application icon if available
+        icon_path = resource_path("vault.ico")
+        if os.path.exists(icon_path):
+            try:
+                self.root.iconbitmap(icon_path)
+            except Exception:
+                pass
 
         self.toast = Toast(self.root)
 
@@ -1345,10 +1695,12 @@ class VaultApp:
         self._open_modal       = None
         self._main_outer: tk.Frame | None = None
 
-        # Style ttk widgets
         self._init_ttk_styles()
 
-        log.info("VAULT application started.")
+        # Check migrations & update events
+        self._startup_toast_msg = _check_legacy_migration() or _check_app_version_update()
+
+        log.info("%s v%s started (Data: %s).", PRODUCT_NAME, APP_VERSION, DATA_DIR)
         self.root.withdraw()
         MasterPasswordGate(self.root, self._on_unlock)
 
@@ -1359,7 +1711,6 @@ class VaultApp:
         except tk.TclError:
             pass
 
-        # Treeview styling (Item 20)
         style.configure(
             "Vault.Treeview",
             background=T.card,
@@ -1399,6 +1750,9 @@ class VaultApp:
         self._bind_activity()
         self._reset_autolock_timer()
         self.root.bind("<Unmap>", self._on_minimise)
+        if self._startup_toast_msg:
+            self.toast.show(self._startup_toast_msg, "info")
+            self._startup_toast_msg = None
         log.info("Vault UI loaded.")
 
     def _on_minimise(self, event):
@@ -1491,7 +1845,7 @@ class VaultApp:
 
     # ── Shutdown ──────────────────────────────────────────────────────────────
     def _on_close(self):
-        log.info("VAULT application closing.")
+        log.info("%s application closing.", PRODUCT_NAME)
         for attr in ("_clock_job", "_autolock_job", "_clipboard_job"):
             self._cancel_job(attr)
         for jid in self._reveal_hide_jobs:
@@ -1523,14 +1877,15 @@ class VaultApp:
         logo = tk.Frame(hdr, bg=T.bg)
         logo.pack(side="left")
         tk.Label(logo, text="◈", fg=T.accent, bg=T.bg, font=FONT_ICON_LG).pack(side="left", padx=(0, 8))
-        tk.Label(logo, text="VAULT", fg=T.text, bg=T.bg, font=FONT_LOGO).pack(side="left")
-        tk.Label(logo, text=" AES-256 SECURE STORE", fg=T.text_muted, bg=T.bg,
+        tk.Label(logo, text=f"{PRODUCT_NAME}", fg=T.text, bg=T.bg, font=FONT_LOGO).pack(side="left")
+        tk.Label(logo, text=f" v{APP_VERSION}  AES-256 STORE", fg=T.text_muted, bg=T.bg,
                  font=(FONT_MONO, 9)).pack(side="left", padx=(6, 0), pady=(8, 0))
 
-        # Header utility buttons
         tools_row = tk.Frame(hdr, bg=T.bg)
         tools_row.pack(side="right", padx=(8, 0))
 
+        GoldButton(tools_row, "ℹ  ABOUT", variant="ghost",
+                   command=self._open_about_dialog).pack(side="left", padx=2)
         GoldButton(tools_row, "🔑  KEY", variant="ghost",
                    command=self._open_change_pw_modal).pack(side="left", padx=2)
         GoldButton(tools_row, "⬆  EXPORT", variant="ghost",
@@ -1605,7 +1960,7 @@ class VaultApp:
         if name == "vault":
             self._refresh_vault_list()
 
-    # ── TAB: ADD ENTRY (Item 21: Generator & Strength) ────────────────────────
+    # ── TAB: ADD ENTRY ────────────────────────────────────────────────────────
     def _build_add_tab(self, parent: tk.Frame) -> tk.Frame:
         frame = tk.Frame(parent, bg=T.bg)
         card  = _build_card(frame, "ADD NEW CREDENTIAL", T.accent,
@@ -1632,13 +1987,11 @@ class VaultApp:
                                      placeholder="Repeat password", show="●")
         self.add_pass2.grid(row=1, column=1, sticky="ew", pady=(0, 8))
 
-        # Generator & Option bar (Item 21)
         gen_bar = tk.Frame(form, bg=T.card)
         gen_bar.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(0, 12))
         GoldButton(gen_bar, "🎲  GENERATE RANDOM PASSWORD", variant="ghost",
                    command=self._generate_add_password).pack(side="left")
 
-        # Strength meter
         sf = tk.Frame(form, bg=T.input_bg,
                       highlightbackground=T.border, highlightthickness=1)
         sf.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(0, PAD_SECTION))
@@ -1752,6 +2105,8 @@ class VaultApp:
 
         try:
             entries = load_vault()
+        except SchemaDowngradeError as exc:
+            self.toast.show(str(exc), "error"); return
         except (InvalidTag, ValueError) as exc:
             log.error("Retrieve failed — vault decrypt error: %s", type(exc).__name__)
             self.toast.show("Vault decryption failed — wrong key?", "error"); return
@@ -1845,16 +2200,14 @@ class VaultApp:
             fg=T.text_dim, bg=T.card, font=FONT_INPUT, justify="center",
         ).place(relx=0.5, rely=0.5, anchor="center")
 
-    # ── TAB: VAULT (Items 18, 19, 20: Treeview, Dynamic Filter & Edit) ────────
+    # ── TAB: VAULT (Treeview & Filter) ────────────────────────────────────────
     def _build_vault_tab(self, parent: tk.Frame) -> tk.Frame:
         frame = tk.Frame(parent, bg=T.bg)
         card  = _build_card(frame, "VAULT CONTENTS", T.accent)
 
-        # Top control bar: search/filter + count + action buttons
         ctl_bar = tk.Frame(card, bg=T.card, padx=PAD_CARD, pady=PAD_ROW)
         ctl_bar.pack(fill="x")
 
-        # Dynamic search filter (Item 19)
         self.vault_filter_var = tk.StringVar()
         sf_frame = tk.Frame(ctl_bar, bg=T.input_bg, padx=8, pady=4,
                             highlightbackground=T.border, highlightthickness=1)
@@ -1869,7 +2222,6 @@ class VaultApp:
         self.vault_search_entry.pack(side="left", fill="x", expand=True)
         self.vault_filter_var.trace_add("write", lambda *args: self._filter_treeview())
 
-        # Buttons in control bar
         GoldButton(ctl_bar, "👁  REVEAL", variant="violet",
                    command=self._reveal_selected_tree).pack(side="left", padx=2)
         GoldButton(ctl_bar, "✎  EDIT", variant="primary",
@@ -1879,17 +2231,14 @@ class VaultApp:
         GoldButton(ctl_bar, "⟳  REFRESH", variant="ghost",
                    command=self._refresh_vault_list).pack(side="left", padx=2)
 
-        # Separator
         tk.Frame(card, bg=T.border, height=HEIGHT_SEP).pack(fill="x", pady=(4, 0))
 
-        # Status / count row
         status_row = tk.Frame(card, bg=T.card, padx=PAD_CARD, pady=4)
         status_row.pack(fill="x")
         self.entry_count_lbl = tk.Label(status_row, text="", fg=T.text_muted,
                                         bg=T.card, font=(FONT_MONO, 8))
         self.entry_count_lbl.pack(side="left")
 
-        # Treeview Container (Item 20)
         tree_container = tk.Frame(card, bg=T.card, padx=PAD_CARD, pady=(0, PAD_ROW))
         tree_container.pack(fill="both", expand=True)
 
@@ -1919,10 +2268,8 @@ class VaultApp:
         tree_scroll.pack(side="right", fill="y")
         self.tree.pack(side="left", fill="both", expand=True)
 
-        # Double click row to reveal
         self.tree.bind("<Double-1>", lambda _: self._reveal_selected_tree())
 
-        # Bottom path badge
         db_bar = tk.Frame(card, bg=T.input_bg, padx=PAD_CARD, pady=4)
         db_bar.pack(fill="x")
         tk.Label(db_bar, text=f"◈ Vault: {DB_FILE}", fg=T.text_dim,
@@ -1933,6 +2280,9 @@ class VaultApp:
     def _refresh_vault_list(self):
         try:
             self._cached_entries = load_vault()
+        except SchemaDowngradeError as exc:
+            self.toast.show(str(exc), "error")
+            self._cached_entries = []
         except (InvalidTag, ValueError):
             log.error("Vault list refresh: decryption failed.")
             self.toast.show("Vault decryption failed — wrong key?", "error")
@@ -1944,7 +2294,6 @@ class VaultApp:
         self._filter_treeview()
 
     def _filter_treeview(self):
-        """Populate treeview based on search filter (Item 19)."""
         for item in self.tree.get_children():
             self.tree.delete(item)
 
@@ -1959,7 +2308,6 @@ class VaultApp:
                 continue
 
             visible_count += 1
-            # Passwords ALWAYS masked in treeview (Item 20)
             self.tree.insert(
                 "",
                 "end",
@@ -2003,14 +2351,12 @@ class VaultApp:
             self._open_modal = modal
 
     def _edit_selected_tree(self):
-        """Edit selected entry with re-authentication (Item 18)."""
         idx = self._get_selected_index()
         if idx is None:
             return
         entries = getattr(self, "_cached_entries", [])
         if 0 <= idx < len(entries):
             entry = entries[idx]
-            # Must re-authenticate with master password before opening edit dialog
             def on_reauth_success(_):
                 EditEntryModal(
                     self.root,
@@ -2048,12 +2394,14 @@ class VaultApp:
                     log.error("Delete failed: %s", type(exc).__name__)
                     self.toast.show("Delete failed — see vault.log.", "error")
 
-    # ── Utilities (Items 22 & 23) ─────────────────────────────────────────────
+    # ── Utilities ─────────────────────────────────────────────────────────────
+    def _open_about_dialog(self):
+        AboutDialog(self.root)
+
     def _open_change_pw_modal(self):
         ChangeMasterPasswordModal(self.root, self.toast)
 
     def _export_backup(self):
-        """Export encrypted .vlt backup file (Item 23)."""
         if not os.path.exists(DB_FILE):
             self.toast.show("No vault file to export.", "warning"); return
 
@@ -2079,7 +2427,6 @@ class VaultApp:
             self.toast.show("Export failed — see vault.log.", "error")
 
     def _import_backup(self):
-        """Import encrypted .vlt backup file (Item 23)."""
         src = filedialog.askopenfilename(
             parent=self.root,
             title="Import Encrypted Vault Backup",
@@ -2100,7 +2447,168 @@ class VaultApp:
         self.root.mainloop()
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  BUILT-IN SELF-TEST MODE (Item 29)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_selftest() -> int:
+    """
+    Executes a comprehensive headless self-test in an isolated temporary directory.
+    Verifies:
+      1. Tkinter can initialize headlessly.
+      2. Cryptography and argon2-cffi can import and function.
+      3. Argon2id key derivation and AES-256-GCM round trip.
+      4. resource_path() resolution.
+      5. Complete vault lifecycle (creation, encryption, saving, reopening).
+    Exits with 0 on success, 1 on failure.
+    """
+    import tempfile
+    print(f"[*] Starting {PRODUCT_NAME} v{APP_VERSION} self-test...")
+    failures = []
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        report_file = os.path.join(tmp_dir, "selftest_report.txt")
+        try:
+            # 1. Tkinter check
+            print("  [1/5] Checking Tkinter environment...")
+            r = tk.Tk()
+            r.withdraw()
+            r.update()
+            r.destroy()
+        except Exception as exc:
+            failures.append(f"Tkinter failed: {exc}")
+
+        try:
+            # 2. Crypto imports & round-trip check
+            print("  [2/5] Testing Argon2id & AES-256-GCM cryptography...")
+            salt = os.urandom(16)
+            k = hash_secret_raw(b"selftest_secret_pass", salt, 2, 65536, 4, 32, Argon2Type.ID)
+            nonce = os.urandom(12)
+            aesgcm = AESGCM(k)
+            payload = b"TopSecretVaultPayloadRoundTrip"
+            ct = aesgcm.encrypt(nonce, payload, None)
+            pt = aesgcm.decrypt(nonce, ct, None)
+            if pt != payload:
+                failures.append("AESGCM decrypt result mismatch.")
+        except Exception as exc:
+            failures.append(f"Crypto round-trip failed: {exc}")
+
+        try:
+            # 3. Resource path check
+            print("  [3/5] Verifying resource_path resolution...")
+            rp = resource_path("vault.ico")
+            if not isinstance(rp, str):
+                failures.append("resource_path did not return a valid string path.")
+        except Exception as exc:
+            failures.append(f"resource_path failed: {exc}")
+
+        try:
+            # 4. Password generator check
+            print("  [4/5] Testing secure password generator...")
+            pw = generate_password(16)
+            if len(pw) != 16:
+                failures.append("Password generator returned incorrect length.")
+        except Exception as exc:
+            failures.append(f"Password generator failed: {exc}")
+
+        try:
+            # 5. Isolated vault file lifecycle check
+            print("  [5/5] Testing isolated vault file I/O and encryption...")
+            tmp_vault = os.path.join(tmp_dir, "test_vault.vlt")
+            tmp_salt = os.urandom(ARGON2_SALT_LEN)
+            tmp_key = _derive_key("MasterPassSelfTest#2026", tmp_salt)
+            sample_data = {
+                "schema_version": VAULT_SCHEMA_VERSION,
+                "entries": [
+                    {"label": "SelfTestSite", "username": "tester", "password": "SamplePassword123!", "created": "2026-11-12"}
+                ]
+            }
+            tmp_blob = _aes_encrypt(json.dumps(sample_data).encode("utf-8"), tmp_key)
+            hdr = _build_header(tmp_salt)
+            with open(tmp_vault, "w", encoding="utf-8") as f:
+                f.write(json.dumps(hdr) + "\n" + tmp_blob + "\n")
+
+            with open(tmp_vault, "r", encoding="utf-8") as f:
+                lines = f.read().splitlines()
+            read_hdr = json.loads(lines[0])
+            read_salt = bytes.fromhex(read_hdr["salt"])
+            read_key = _derive_key("MasterPassSelfTest#2026", read_salt)
+            read_pt = _aes_decrypt(lines[1], read_key)
+            parsed = json.loads(read_pt.decode("utf-8"))
+            if parsed.get("entries")[0]["label"] != "SelfTestSite":
+                failures.append("Vault lifecycle round-trip entry mismatch.")
+        except Exception as exc:
+            failures.append(f"Vault lifecycle test failed: {exc}")
+
+        # Write report
+        with open(report_file, "w", encoding="utf-8") as rf:
+            if not failures:
+                rf.write(f"SELFTEST PASSED - {PRODUCT_NAME} v{APP_VERSION}\n")
+            else:
+                rf.write("SELFTEST FAILED\n" + "\n".join(failures) + "\n")
+
+        if failures:
+            print("\n[-] SELFTEST FAILED:")
+            for f in failures:
+                print(f"  - {f}")
+            return 1
+
+    print("\n[+] SELFTEST PASSED: All subsystems operational.")
+    return 0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  GLOBAL EXCEPTION HANDLERS (Item 28)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _global_excepthook(exc_type, exc_value, exc_traceback):
+    """Logs unhandled exceptions to vault.log and shows friendly error dialog."""
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+
+    log.critical(
+        "Unhandled exception: %s: %s", exc_type.__name__, exc_value,
+        exc_info=(exc_type, exc_value, exc_traceback)
+    )
+    try:
+        messagebox.showerror(
+            f"{PRODUCT_NAME} — Unexpected Error",
+            f"An unexpected error occurred:\n{exc_type.__name__}: {exc_value}\n\n"
+            f"Diagnostics logged to:\n{LOG_FILE}",
+        )
+    except Exception:
+        pass
+
+
+def _tk_callback_exception(exc_type, exc_value, exc_traceback):
+    _global_excepthook(exc_type, exc_value, exc_traceback)
+
+
 # ─── ENTRY POINT ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    app = VaultApp()
-    app.run()
+    if "--selftest" in sys.argv:
+        sys.exit(run_selftest())
+
+    # Install global exception handlers
+    sys.excepthook = _global_excepthook
+    tk.Tk.report_callback_exception = _tk_callback_exception
+
+    # Enforce single-instance protection
+    instance_lock = SingleInstanceLock(LOCK_FILE)
+    if not instance_lock.acquire():
+        # Another instance is running
+        try:
+            root_err = tk.Tk()
+            root_err.withdraw()
+            messagebox.showerror(PRODUCT_NAME, f"{PRODUCT_NAME} is already running.")
+            root_err.destroy()
+        except Exception:
+            pass
+        sys.exit(1)
+
+    try:
+        app = VaultApp()
+        app.run()
+    finally:
+        instance_lock.release()
