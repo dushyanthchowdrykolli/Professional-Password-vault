@@ -34,3 +34,4 @@ Thank you for downloading VAULT — the offline, dark-luxury password vault.
    - You can verify the integrity of this package using the published SHA-256
      checksum in SHA256SUMS.txt.
 ========================================================================
+

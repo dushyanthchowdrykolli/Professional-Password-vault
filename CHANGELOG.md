@@ -12,3 +12,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Tier 2 — Hardening & Quality**: Pure-function input validation, automatic vault lock on 5-minute inactivity and window minimize, clipboard copy with 20-second auto-clear timer, rotating audit log without secret leakage, clean shutdown after-job cancellation.
 - **Tier 3 — Advanced Features**: ttk.Treeview table, live dynamic search filter across label and username, entry editing with re-authentication, `secrets` CSPRNG password generator, master password change with full vault re-encryption, encrypted `.vlt` export/import backups.
 - **Tier 4 — Standalone Windows Release**: Standalone onedir Windows distribution (no Python required), decoupled user data in `%APPDATA%\VAULT\`, OS-level single-instance file lock (msvcrt), schema migration framework with downgrade protection, `--selftest` diagnostic flag, automated build script, and Inno Setup installer script.
+

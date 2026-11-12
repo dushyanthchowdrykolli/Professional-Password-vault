@@ -11,3 +11,4 @@ PRODUCT_NAME = "VAULT"
 COMPANY_NAME = "VAULT Security"
 FILE_DESCRIPTION = "VAULT — AES-256-GCM Encrypted Password Manager"
 COPYRIGHT = "Copyright © 2026 VAULT Security. All rights reserved."
+

@@ -85,3 +85,4 @@ Before publishing:
    - `SHA256SUMS.txt`
    - (Optional) `VAULT-Setup-1.0.0.exe` (if compiled with Inno Setup)
 4. Publish the checksum and release notes.
+
